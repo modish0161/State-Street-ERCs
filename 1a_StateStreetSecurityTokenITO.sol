@@ -1,119 +1,94 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
-contract SecurityTokenITO is ERC20, Ownable, Pausable, ReentrancyGuard {
-    
-    uint256 public immutable totalSupplyCap;
-    uint256 public ITOEndTime;
-    bool public isITOActive;
-    uint256 public totalAllocated;
-    
-    struct Allocation {
-        uint256 amount;
-        bool claimed;
-    }
+contract InitialTokenOffering is Ownable, ReentrancyGuard {
+    using SafeMath for uint256;
 
-    mapping(address => Allocation) public allocations;
+    IERC20 public token;
+    uint256 public tokenPrice;
+    uint256 public totalSupply;
+    uint256 public tokensSold;
+    bool public saleActive;
+
+    mapping(address => uint256) public balances;
     mapping(address => bool) public whitelistedInvestors;
+    bytes32 public complianceCriteria;
 
-    event ITOStarted(uint256 startTime, uint256 endTime);
-    event ITOEnded(uint256 endTime);
-    event TokensAllocated(address indexed investor, uint256 amount);
+    event SaleStarted(uint256 startTime, uint256 endTime);
+    event TokensPurchased(address indexed investor, uint256 amount);
+    event SaleEnded();
+    event TokensDistributed(address indexed investor, uint256 amount);
     event TokensClaimed(address indexed investor, uint256 amount);
     event InvestorWhitelisted(address indexed investor);
-    
-    constructor(string memory name, string memory symbol, uint256 _totalSupplyCap) 
-        ERC20(name, symbol) 
-    {
-        require(_totalSupplyCap > 0, "Total supply cap must be greater than zero");
-        totalSupplyCap = _totalSupplyCap;
-        isITOActive = false;
+    event ComplianceChecked(address indexed investor, bool compliant);
+
+    constructor(IERC20 _token, uint256 _tokenPrice, uint256 _totalSupply) {
+        token = _token;
+        tokenPrice = _tokenPrice;
+        totalSupply = _totalSupply;
     }
 
-    modifier onlyDuringITO() {
-        require(isITOActive && block.timestamp < ITOEndTime, "ITO is not active");
+    modifier onlyDuringSale() {
+        require(saleActive, "Sale is not active");
         _;
     }
 
-    modifier onlyInvestors() {
-        require(whitelistedInvestors[msg.sender], "Not a whitelisted investor");
-        _;
+    function startSale(uint256 startTime, uint256 endTime) external onlyOwner {
+        require(!saleActive, "Sale is already active");
+        saleActive = true;
+        emit SaleStarted(startTime, endTime);
     }
 
-    function startITO(uint256 startTime, uint256 endTime) external onlyOwner {
-        require(!isITOActive, "ITO is already active");
-        require(endTime > startTime, "End time must be later than start time");
+    function buyTokens() external payable onlyDuringSale nonReentrant {
+        require(whitelistedInvestors[msg.sender], "Investor is not whitelisted");
+        uint256 tokensToBuy = msg.value.div(tokenPrice);
+        require(tokensToBuy <= totalSupply.sub(tokensSold), "Not enough tokens available");
 
-        ITOEndTime = endTime;
-        isITOActive = true;
+        tokensSold = tokensSold.add(tokensToBuy);
+        balances[msg.sender] = balances[msg.sender].add(tokensToBuy);
 
-        emit ITOStarted(startTime, endTime);
+        emit TokensPurchased(msg.sender, tokensToBuy);
     }
 
-    function endITO() external onlyOwner {
-        require(isITOActive, "ITO is not active");
-        require(block.timestamp >= ITOEndTime, "ITO end time not reached");
-
-        isITOActive = false;
-
-        emit ITOEnded(ITOEndTime);
+    function endSale() external onlyOwner {
+        require(saleActive, "Sale is not active");
+        saleActive = false;
+        emit SaleEnded();
     }
 
-    function whitelistInvestor(address investor) external onlyOwner {
-        require(investor != address(0), "Invalid address");
-        whitelistedInvestors[investor] = true;
-        emit InvestorWhitelisted(investor);
+    function distributeTokens(address investor, uint256 amount) external onlyOwner {
+        require(balances[investor] >= amount, "Insufficient balance");
+        token.transfer(investor, amount);
+        balances[investor] = balances[investor].sub(amount);
+
+        emit TokensDistributed(investor, amount);
     }
 
-    function allocateTokens(address investor, uint256 amount) 
-        external 
-        onlyOwner 
-        onlyDuringITO 
-    {
-        require(whitelistedInvestors[investor], "Investor is not whitelisted");
-        require(totalAllocated + amount <= totalSupplyCap, "Total allocation exceeds cap");
+    function claimTokens() external nonReentrant {
+        uint256 amount = balances[msg.sender];
+        require(amount > 0, "No tokens to claim");
 
-        allocations[investor].amount += amount;
-        totalAllocated += amount;
-
-        emit TokensAllocated(investor, amount);
-    }
-
-    function claimTokens() external onlyInvestors nonReentrant whenNotPaused {
-        require(!isITOActive, "ITO is still active");
-        require(allocations[msg.sender].amount > 0, "No tokens to claim");
-        require(!allocations[msg.sender].claimed, "Tokens already claimed");
-
-        uint256 amount = allocations[msg.sender].amount;
-        allocations[msg.sender].claimed = true;
-
-        _mint(msg.sender, amount);
+        balances[msg.sender] = 0;
+        token.transfer(msg.sender, amount);
 
         emit TokensClaimed(msg.sender, amount);
     }
 
-    function pause() external onlyOwner {
-        _pause();
+    function whitelistInvestor(address investor) external onlyOwner {
+        whitelistedInvestors[investor] = true;
+        emit InvestorWhitelisted(investor);
     }
 
-    function unpause() external onlyOwner {
-        _unpause();
+    function setComplianceCriteria(bytes32 criteria) external onlyOwner {
+        complianceCriteria = criteria;
     }
 
-    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
-        require(token != address(0), "Invalid token address");
-        require(amount > 0, "Amount must be greater than zero");
-        require(IERC20(token).balanceOf(address(this)) >= amount, "Insufficient token balance");
-        IERC20(token).transfer(msg.sender, amount);
-    }
-
-    // Prevent accidentally sending Ether to the contract
-    receive() external payable {
-        revert("Contract does not accept Ether");
+    function checkCompliance(address investor) external view returns (bool) {
+        return whitelistedInvestors[investor];  // Implement actual compliance logic
     }
 }
